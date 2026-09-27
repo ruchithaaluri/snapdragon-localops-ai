@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local runtime state (never commit user data)
+logs/
+*.log
+*.db
+*.db-wal
+*.db-shm
+config/localops.toml
+.env
+.env.*
+
+# Compiled / downloaded model artifacts (large binaries, never committed)
+models/
+artifacts/
+*.dlc
+*.tflite
+*.litert
+*.qnnbin
+*.onnx
+*.ort
+
+# Ad-hoc development scratch scripts (kept locally, never committed).
+# These are throwaway harnesses, not part of the package. See README.md for the
+# real project layout.
+_check_*.py
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

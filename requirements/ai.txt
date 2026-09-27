@@ -1,0 +1,19 @@
+# OPTIONAL local inference stack. NOT installed during Phase 1.
+#
+# Rationale: the application must run (and be testable) on a plain Windows x64
+# machine with no accelerator present. ONNX Runtime is hardware-agnostic and is
+# the portable execution layer; the Snapdragon/NPU path is a *separate* backend
+# that is added later on the target hardware (see docs/NPU_EXECUTION.md).
+#
+#   python -m pip install -r requirements/ai.txt
+#
+# Deliberately absent from this file:
+#   * Qualcomm AI Hub Workbench / qai_hub - cloud-side model compilation tool.
+#     It is used to produce target binaries, not to run them on the PC. Install
+#     it only on the machine that compiles models, and never at runtime.
+#   * Any vendor execution provider (QNN/Qualcomm EP). Added in the Snapdragon
+#     backend package once measured on the target device.
+-r base.txt
+
+numpy>=1.26
+onnxruntime>=1.17

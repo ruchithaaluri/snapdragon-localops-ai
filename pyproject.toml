@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snapdragon-localops"
+version = "0.1.0"
+description = "Local-first multimodal developer diagnostic assistant for Snapdragon-powered Windows PCs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Snapdragon LocalOps AI team" }]
+keywords = ["diagnostics", "local-ai", "onnxruntime", "pyside6", "rag", "snapdragon"]
+
+# Base runtime dependencies: GUI shell + configuration only.
+# No AI engine, no accelerator, no Snapdragon-specific package is required to
+# start the application. See requirements/ai.txt for the optional inference stack.
+dependencies = [
+    "PySide6>=6.7,<7",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.3,<3",
+]
+
+[project.optional-dependencies]
+# Optional local inference stack. Installed only when local model execution is
+# actually needed. ONNX Runtime is hardware-agnostic: it runs on x64 today and
+# on the Snapdragon target it can be paired with a vendor execution provider.
+ai = [
+    "numpy>=1.26",
+    "onnxruntime>=1.17",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.gui-scripts]
+snapdragon-localops = "app.main:main"
+
+[project.urls]
+Documentation = "https://github.com/snapdragon-localops/snapdragon-localops/blob/main/ARCHITECTURE.md"
+
+[tool.setuptools]
+packages = [
+    "app",
+    "app.ui",
+    "app.ui.panels",
+    "app.ui.widgets",
+    "ai",
+    "ai.backends",
+    "ai.runtime",
+    "benchmark",
+    "core",
+    "core.config",
+    "core.contracts",
+    "core.observability",
+    "core.storage",
+    "diagnostics",
+    "diagnostics.remediation",
+    "retrieval",
+    "verification",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "ui: tests that construct Qt widgets (require PySide6)",
+    "integration: tests that span multiple layers",
+    "requires_onnx: tests that need an optional ONNX Runtime install",
+]
+filterwarnings = [
+    "error::DeprecationWarning:core.*",
+    "error::DeprecationWarning:app.*",
+]

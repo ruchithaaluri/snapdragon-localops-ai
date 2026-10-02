@@ -18,6 +18,7 @@ Two properties are load-bearing:
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Sequence
 
 from core.config.schema import AppSettings
@@ -33,10 +34,11 @@ from core.contracts.pipeline import (
 from core.contracts.retrieval import Retriever, SearchQuery
 from core.contracts.remediation import RemediationResult
 from core.contracts.verification import VerificationCheck, VerificationReport
-from core.errors import InsufficientEvidenceError
+from core.errors import InsufficientEvidenceError, LocalOpsError
 from core.ids import new_run_id
 from core.observability import get_logger, log_event
 from core.safety import ApprovalRecord, InMemoryApprovalGate, SafetyPolicy
+from core.storage import SqliteStore, open_store
 from core.timing import Stopwatch
 from core.version import __version__
 from diagnostics import RuleBasedDiagnosticEngine
@@ -46,7 +48,12 @@ from diagnostics.remediation import (
 )
 from verification import LocalVerificationRunner
 
-__all__ = ["LocalDiagnosticPipeline", "build_pipeline"]
+__all__ = [
+    "LocalDiagnosticPipeline",
+    "build_pipeline",
+    "build_retriever",
+    "build_store",
+]
 
 _log = get_logger(__name__)
 
@@ -71,6 +78,11 @@ class LocalDiagnosticPipeline(Pipeline):
         are attached to the query as *context* - never as evidence.
     policy:
         The safety policy the executor enforces.
+    store:
+        Optional. When supplied, each run is appended to this local database.
+        Persistence is best effort: a storage failure is logged and the run is
+        still returned, because the diagnosis is the product and the history is
+        only a record of it.
     """
 
     kind = "pipeline"
@@ -84,6 +96,9 @@ class LocalDiagnosticPipeline(Pipeline):
         gate: InMemoryApprovalGate | None = None,
         retriever: Retriever | None = None,
         policy: SafetyPolicy | None = None,
+        store: SqliteStore | None = None,
+        retrieval_top_k: int = 8,
+        retrieval_min_score: float = 0.0,
     ) -> None:
         self._engine = engine
         self._executor = executor
@@ -91,6 +106,9 @@ class LocalDiagnosticPipeline(Pipeline):
         self._gate = gate or InMemoryApprovalGate()
         self._retriever = retriever
         self._policy = policy or executor.policy
+        self._store = store
+        self._retrieval_top_k = retrieval_top_k
+        self._retrieval_min_score = retrieval_min_score
 
     @property
     def info(self) -> ProviderInfo:
@@ -109,6 +127,16 @@ class LocalDiagnosticPipeline(Pipeline):
     def gate(self) -> InMemoryApprovalGate:
         """The gate the UI records the user's decisions into."""
         return self._gate
+
+    @property
+    def store(self) -> SqliteStore | None:
+        """The local run history, when persistence is enabled."""
+        return self._store
+
+    @property
+    def retriever(self) -> Retriever | None:
+        """The retriever supplying project context, when one is configured."""
+        return self._retriever
 
     def run(self, query: object, *, auto_approve: bool = False) -> PipelineRun:
         """Run the pipeline, stopping at the approval gate unless already approved."""
@@ -156,7 +184,7 @@ class LocalDiagnosticPipeline(Pipeline):
                 StageRecord(
                     stage=PipelineStage.RETRIEVAL,
                     status=StageStatus.SKIPPED,
-                    detail="no retriever configured, or its index is empty",
+                    detail=self._retrieval_reason(),
                 )
             )
 
@@ -181,12 +209,16 @@ class LocalDiagnosticPipeline(Pipeline):
                 run_id=run_id,
                 detail=str(exc),
             )
-            return PipelineRun(
+            unresolved = PipelineRun(
                 query=query,  # type: ignore[arg-type]
                 stages=tuple(stages),
                 run_id=run_id,
                 outcome=StageOutcome.UNRESOLVED,
             )
+            # An unresolved run is still a run: the user asked, the evidence was
+            # not enough, and that fact is worth remembering.
+            self._persist(unresolved)
+            return unresolved
         stages.append(
             StageRecord(
                 stage=PipelineStage.DIAGNOSIS,
@@ -262,6 +294,7 @@ class LocalDiagnosticPipeline(Pipeline):
             outcome=outcome.value,
             stages=len(stages),
         )
+        self._persist(run)
         return run
 
     def verify(
@@ -300,6 +333,46 @@ class LocalDiagnosticPipeline(Pipeline):
 
     # -- internals --------------------------------------------------------
 
+    def _persist(self, run: PipelineRun) -> None:
+        """Append the run to local history. Best effort, and never fatal.
+
+        The diagnosis is the product; the database is only a record of it. A
+        locked file, a full disk or a read-only profile must cost the user their
+        history and nothing else, so every failure is caught and logged rather
+        than raised. It is never silent either.
+        """
+        if self._store is None:
+            return
+        try:
+            self._store.save_run(
+                run_id=run.run_id,
+                question=run.query.question,
+                outcome=run.outcome.value,
+                created_at=run.created_at,
+                payload=_run_payload(run),
+            )
+            if run.query.evidence:
+                self._store.save_evidence(run.run_id, run.query.evidence)
+            for record in run.approvals:
+                self._store.save_approval(run.run_id, record)
+        except Exception as exc:  # noqa: BLE001 - history is optional, the run is not
+            log_event(
+                _log,
+                logging.WARNING,
+                "pipeline.persist_failed",
+                run_id=run.run_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _retrieval_reason(self) -> str:
+        """Why retrieval will add nothing, stated precisely rather than vaguely."""
+        if self._retriever is None:
+            return "no retriever configured"
+        index = self._retriever.index()
+        if index is None:
+            return "the configured retriever exposes no index"
+        return f"the local index holds no chunks ({index.count()})"
+
     def _with_retrieval(self, query: object, run_id: str) -> object:
         """Attach retrieved passages as *context*, never as evidence.
 
@@ -312,7 +385,13 @@ class LocalDiagnosticPipeline(Pipeline):
         index = self._retriever.index()
         if index is None or index.count() == 0:
             return query
-        result = self._retriever.retrieve(SearchQuery(text=query.question))  # type: ignore[attr-defined]
+        result = self._retriever.retrieve(
+            SearchQuery(
+                text=query.question,  # type: ignore[attr-defined]
+                top_k=self._retrieval_top_k,
+                min_score=self._retrieval_min_score,
+            )
+        )
         if not result.hits:
             return query
         return type(query)(  # type: ignore[call-arg]
@@ -341,8 +420,92 @@ class LocalDiagnosticPipeline(Pipeline):
         return StageOutcome.REMEDIATED
 
 
-def build_pipeline(settings: AppSettings) -> LocalDiagnosticPipeline:
-    """Assemble a pipeline from validated configuration."""
+def build_store(settings: AppSettings) -> SqliteStore | None:
+    """Open the local run history, or return ``None`` if it is unavailable.
+
+    History is a convenience, not a prerequisite. A locked file, a read-only
+    profile or a missing directory costs the user their run history and nothing
+    else, so the failure is logged and the application carries on.
+    """
+    if not settings.storage.enabled:
+        log_event(
+            _log, logging.INFO, "storage.disabled", detail="run history is switched off"
+        )
+        return None
+    try:
+        return open_store(settings.database_path)
+    except Exception as exc:  # noqa: BLE001 - history is optional
+        log_event(
+            _log,
+            logging.WARNING,
+            "storage.unavailable",
+            path=str(settings.database_path),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return None
+
+
+def build_retriever(settings: AppSettings, *, ai_backend=None) -> Retriever | None:
+    """A local retriever over a restored (usually empty) index, or ``None``.
+
+    Nothing is indexed automatically. The corpus stays empty until the user
+    indexes something, so the retrieval stage reports itself as skipped with an
+    accurate reason instead of returning passages that do not exist. Embeddings
+    come from the configured AI backend; in Phase 1 that is the deterministic
+    mock, which matches words rather than meaning, and says so in its own
+    provenance.
+    """
+    from ai.registry import build_ai_backend
+    from retrieval import InMemoryVectorIndex, LocalRetriever
+
+    try:
+        backend = ai_backend if ai_backend is not None else build_ai_backend(settings)
+    except LocalOpsError as exc:
+        log_event(_log, logging.WARNING, "retrieval.ai_unavailable", error=str(exc))
+        return None
+
+    embeddings = backend.embeddings
+    if embeddings is None:
+        log_event(
+            _log,
+            logging.INFO,
+            "retrieval.unavailable",
+            backend=backend.info.name,
+            detail="the configured backend provides no embeddings",
+        )
+        return None
+
+    index = InMemoryVectorIndex(dimension=embeddings.dimension)
+    snapshot = settings.index_path
+    if settings.retrieval.persist_index and snapshot.is_file():
+        try:
+            index.load(str(snapshot))
+        except Exception as exc:  # noqa: BLE001 - a bad index must not stop start-up
+            log_event(
+                _log,
+                logging.WARNING,
+                "retrieval.index_unreadable",
+                path=str(snapshot),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+    return LocalRetriever(embeddings, index)
+
+
+def build_pipeline(
+    settings: AppSettings,
+    *,
+    store: SqliteStore | None = None,
+    retriever: Retriever | None = None,
+    ai_backend=None,
+    open_history: bool = True,
+) -> LocalDiagnosticPipeline:
+    """Assemble a pipeline from validated configuration.
+
+    Every collaborator is injectable, so a test can point the store at
+    ``tmp_path`` and a caller that genuinely wants no history can pass
+    ``open_history=False`` rather than leaving ``store`` ambiguous.
+    """
     policy = settings.safety.to_policy()
     engine = RuleBasedDiagnosticEngine(
         require_evidence=settings.diagnostics.require_evidence,
@@ -356,4 +519,56 @@ def build_pipeline(settings: AppSettings) -> LocalDiagnosticPipeline:
     verifier = LocalVerificationRunner(
         gate, stop_on_first_failure=settings.verification.stop_on_first_failure
     )
-    return LocalDiagnosticPipeline(engine, executor, verifier, gate=gate, policy=policy)
+    if retriever is None:
+        retriever = build_retriever(settings, ai_backend=ai_backend)
+    if store is None and open_history:
+        store = build_store(settings)
+    return LocalDiagnosticPipeline(
+        engine,
+        executor,
+        verifier,
+        gate=gate,
+        retriever=retriever,
+        policy=policy,
+        store=store,
+        retrieval_top_k=settings.retrieval.top_k,
+        retrieval_min_score=settings.retrieval.min_score,
+    )
+
+
+def _run_payload(run: PipelineRun) -> dict[str, object]:
+    """The JSON-safe summary written to the run history.
+
+    Deliberately a summary rather than a full copy of the run: the database is a
+    searchable record of what happened, not a second source of truth that could
+    drift from the live objects.
+    """
+    diagnosis = run.diagnosis
+    return {
+        "run_id": run.run_id,
+        "created_at": run.created_at,
+        "question": run.query.question,
+        "outcome": run.outcome.value,
+        "stages": [record.as_row() for record in run.stages],
+        "reasoning_mode": diagnosis.reasoning_mode.value if diagnosis else "",
+        "confidence": diagnosis.confidence if diagnosis else 0.0,
+        "evidence_ids": [item.evidence_id for item in run.query.evidence],
+        "evidence_count": len(run.query.evidence),
+        "hypotheses": [
+            {
+                "id": hypothesis.hypothesis_id,
+                "status": hypothesis.status.value,
+                "confidence": hypothesis.confidence,
+                "statement": hypothesis.statement,
+            }
+            for hypothesis in (diagnosis.ranked() if diagnosis else ())
+        ],
+        "actions": [
+            {
+                "action_id": action.action_id,
+                "title": action.title,
+                "risk": action.risk.value,
+            }
+            for action in (run.plan.actions if run.plan else ())
+        ],
+    }

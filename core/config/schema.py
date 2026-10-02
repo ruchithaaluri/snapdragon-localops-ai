@@ -34,6 +34,7 @@ __all__ = [
     "RetrievalSettings",
     "RuntimeSettings",
     "SafetySettings",
+    "StorageSettings",
     "UiSettings",
     "VerificationSettings",
 ]
@@ -167,6 +168,17 @@ class RetrievalSettings(_Section):
     chunk_overlap: int = Field(default=200, ge=0)
     persist_index: bool = True
     include_error_patterns: bool = True
+    index_name: str = "retrieval.json"
+
+    @field_validator("index_name")
+    @classmethod
+    def _plain_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("index_name must not be empty")
+        if Path(name).name != name:
+            raise ValueError("index_name must be a plain file name, not a path")
+        return name
 
     @model_validator(mode="after")
     def _overlap_fits(self) -> "RetrievalSettings":
@@ -247,6 +259,31 @@ class SafetySettings(_Section):
         )
 
 
+class StorageSettings(_Section):
+    """Local run history.
+
+    A SQLite file on this machine, not a service. Nothing is uploaded, and
+    switching persistence off costs the user their history only - never a
+    diagnostic result, which is the product.
+    """
+
+    enabled: bool = True
+    database_name: str = "localops.db"
+    persist_evidence: bool = True
+    persist_approvals: bool = True
+    max_history: int = Field(default=200, ge=1)
+
+    @field_validator("database_name")
+    @classmethod
+    def _plain_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("database_name must not be empty")
+        if Path(name).name != name:
+            raise ValueError("database_name must be a plain file name, not a path")
+        return name
+
+
 class UiSettings(_Section):
     """Presentation preferences for the desktop shell."""
 
@@ -284,6 +321,7 @@ class AppSettings(BaseSettings):
     verification: VerificationSettings = Field(default_factory=VerificationSettings)
     benchmark: BenchmarkSettings = Field(default_factory=BenchmarkSettings)
     safety: SafetySettings = Field(default_factory=SafetySettings)
+    storage: StorageSettings = Field(default_factory=StorageSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
 
     @property
@@ -299,6 +337,20 @@ class AppSettings(BaseSettings):
         from core.config.paths import models_dir
 
         return models_dir()
+
+    @property
+    def database_path(self) -> Path:
+        """Where the local run history is stored."""
+        from core.config.paths import runtime_dir
+
+        return runtime_dir() / self.storage.database_name
+
+    @property
+    def index_path(self) -> Path:
+        """Where the persisted retrieval index is stored."""
+        from core.config.paths import index_dir
+
+        return index_dir() / self.retrieval.index_name
 
     def enabled_models(self) -> tuple[ModelEntry, ...]:
         return tuple(entry for entry in self.ai.models if entry.enabled)

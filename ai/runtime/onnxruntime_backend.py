@@ -261,6 +261,14 @@ class OnnxRuntimeBackend(InferenceRuntime):
         )
         return verified
 
+    def session_for(self, model: LoadedModel) -> Any:
+        """The live inference session for a loaded model.
+
+        Public so a backend that needs to inspect the graph (input names,
+        declared shapes) can do so without reaching into a private attribute.
+        """
+        return self._session_for(model)
+
     def _session_for(self, model: LoadedModel) -> Any:
         """Fetch the session for a loaded model, or fail loudly."""
         if self._module is None:

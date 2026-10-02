@@ -52,8 +52,13 @@ class EnvironmentPanel(QWidget):
         self._note.setStyleSheet(f"color: {self._theme.text_dim};")
         layout.addWidget(self._note)
 
-    def refresh(self, settings) -> None:  # noqa: ANN001 - AppSettings
-        """Rebuild the table from configuration and the current runtime."""
+    def refresh(self, settings, pipeline=None) -> None:  # noqa: ANN001 - AppSettings
+        """Rebuild the table from configuration and the current runtime.
+
+        ``pipeline`` is optional so the panel can be refreshed from configuration
+        alone; when supplied it contributes the live state of retrieval and run
+        history, which cannot be read from settings.
+        """
         rows: list[tuple[str, str, str]] = [
             ("Application", f"v{__version__} ({settings.environment})", settings.app_name),
             ("Python", platform.python_version(), platform.python_implementation()),
@@ -79,6 +84,7 @@ class EnvironmentPanel(QWidget):
                 "language model reasoning " + ("on" if settings.ai.enable_llm_reasoning else "off"),
             )
         )
+        rows.extend(self._layer_rows(settings, pipeline))
         rows.append(
             (
                 "Remediation",
@@ -94,6 +100,56 @@ class EnvironmentPanel(QWidget):
             )
         )
         self._show(rows, settings)
+
+    @staticmethod
+    def _layer_rows(settings, pipeline) -> list[tuple[str, str, str]]:  # noqa: ANN001
+        """Report retrieval and run history exactly as they are.
+
+        Both rows distinguish "switched off", "available but empty" and "in use",
+        because collapsing those into a single "available" would claim a
+        capability the user does not actually have.
+        """
+        rows: list[tuple[str, str, str]] = []
+
+        # "unknown" is a real answer when no pipeline was supplied. Reporting
+        # "not available" there would turn an absence of inspection into a
+        # negative claim about the machine, which is the thing this panel exists
+        # to avoid.
+        if pipeline is None:
+            rows.append(("Retrieval", "not inspected", "no pipeline was supplied"))
+            rows.append(("Run history", "not inspected", "no pipeline was supplied"))
+            return rows
+
+        retriever = getattr(pipeline, "retriever", None)
+        if retriever is None:
+            rows.append(("Retrieval", "not available", "no embedding backend is configured"))
+        else:
+            index = retriever.index()
+            count = index.count() if index is not None else 0
+            rows.append(
+                (
+                    "Retrieval",
+                    f"{count} chunk(s) indexed" if count else "available, empty",
+                    (
+                        "context only; retrieved text is never treated as evidence"
+                        if count
+                        else "nothing indexed yet, so the stage is skipped"
+                    ),
+                )
+            )
+
+        store = getattr(pipeline, "store", None)
+        if store is None:
+            rows.append(
+                (
+                    "Run history",
+                    "off" if not settings.storage.enabled else "unavailable",
+                    settings.database_path.name,
+                )
+            )
+        else:
+            rows.append(("Run history", "recording", settings.database_path.name))
+        return rows
 
     def show_target(self, target: ExecutionTarget) -> None:
         """Describe a real execution target, distinguishing claim from proof."""

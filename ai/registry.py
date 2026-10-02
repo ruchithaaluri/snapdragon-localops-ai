@@ -21,8 +21,14 @@ __all__ = ["BACKENDS", "build_ai_backend", "build_model_registry"]
 _log = get_logger(__name__)
 
 #: Registered backend factories. Keys are the names accepted in configuration.
+#:
+#: All three implement the same :class:`~core.contracts.ai.AIBackend` facade, so
+#: the application never imports a backend directly. ``mock`` stays the default
+#: because it is the only one that needs neither a model nor a runtime.
 BACKENDS: dict[str, str] = {
     "mock": "ai.backends.mock:MockAIBackend",
+    "local": "ai.backends.local:LightweightLocalAIBackend",
+    "snapdragon": "ai.backends.snapdragon:SnapdragonAIBackend",
 }
 
 #: Names that mean "no backend configured".
@@ -42,6 +48,11 @@ def build_ai_backend(settings: AppSettings) -> AIBackend:
 
     Raises :class:`~core.errors.ProviderNotFoundError` when the configured name
     is not registered, so a misconfiguration is visible immediately.
+
+    Selection never falls back. If ``local`` is configured with no model, the
+    backend reports ``not configured`` rather than quietly reverting to the
+    mock, because demo output shown where a model was expected is exactly the
+    failure this project is built to avoid.
     """
     name = settings.ai.llm.name.strip().lower()
     if name in _UNCONFIGURED:
@@ -57,9 +68,40 @@ def build_ai_backend(settings: AppSettings) -> AIBackend:
             f"unknown AI backend {name!r}",
             available=sorted(BACKENDS),
         )
-    backend = _load(target)()
-    log_event(_log, 20, "ai.backend.selected", backend=name, is_mock=backend.is_mock())
+    backend = _load(target)(**_factory_kwargs(name, settings))
+    log_event(
+        _log,
+        20,
+        "ai.backend.selected",
+        backend=name,
+        is_mock=backend.is_mock(),
+        detail=backend.info.detail,
+    )
     return backend
+
+
+def _factory_kwargs(name: str, settings: AppSettings) -> dict[str, object]:
+    """Keyword arguments for a backend that needs configuration.
+
+    Only the ``local`` backend takes arguments, and only to find out which model
+    files exist on disk. Nothing here downloads, creates or modifies anything.
+    """
+    if name != "local":
+        return {}
+    from core.model_artifact import ModelRole
+
+    registry = build_model_registry(settings)
+    artifact = registry.get(ModelRole.LLM)
+    if artifact is None:
+        return {}
+    from ai.backends.local import LocalModelLlmBackend
+
+    return {
+        "llm_artifact": artifact,
+        "llm_labels": LocalModelLlmBackend.labels_from_options(
+            artifact.metadata.get("labels", "")
+        ),
+    }
 
 
 def build_model_registry(settings: AppSettings):

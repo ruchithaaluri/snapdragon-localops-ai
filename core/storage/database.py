@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,7 +37,11 @@ class RunRecord:
 def _connect(path: Path) -> sqlite3.Connection:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path)
+        # ``check_same_thread=False`` because the pipeline is built on the UI
+        # thread while ``run()`` executes on a worker thread. Every access below
+        # is serialised by ``SqliteStore._lock``, so the connection is never used
+        # by two threads at once.
+        conn = sqlite3.connect(path, check_same_thread=False)
     except (sqlite3.Error, OSError) as exc:  # pragma: no cover - filesystem dependent
         raise StorageError("could not open the local database", path=str(path)) from exc
     conn.row_factory = sqlite3.Row
@@ -51,6 +56,9 @@ class SqliteStore:
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
+        # Re-entrant: ``transaction()`` and ``execute()`` both take it, and the
+        # write helpers call them from inside a transaction.
+        self._lock = threading.RLock()
         self._conn = _connect(self._path)
         self._migrate()
 
@@ -76,14 +84,15 @@ class SqliteStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Commit on success, roll back on error."""
-        try:
-            yield self._conn
-        except Exception:
-            self._conn.rollback()
-            raise
-        else:
-            self._conn.commit()
+        """Commit on success, roll back on error. Serialised against other threads."""
+        with self._lock:
+            try:
+                yield self._conn
+            except Exception:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
 
     def execute(self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()) -> sqlite3.Cursor:
         """Run one statement and commit.
@@ -91,26 +100,29 @@ class SqliteStore:
         ``params`` may be a sequence (for ``?`` placeholders) or a mapping (for
         named ``:placeholders``), which keeps the write statements readable.
         """
-        try:
-            cursor = self._conn.execute(sql, params)  # type: ignore[arg-type]
-            self._conn.commit()
-            return cursor
-        except sqlite3.Error as exc:
-            raise StorageError("statement failed", detail=str(exc)) from exc
+        with self._lock:
+            try:
+                cursor = self._conn.execute(sql, params)  # type: ignore[arg-type]
+                self._conn.commit()
+                return cursor
+            except sqlite3.Error as exc:
+                raise StorageError("statement failed", detail=str(exc)) from exc
 
     def fetchall(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
         """Run a query and return every row."""
-        try:
-            return self._conn.execute(sql, tuple(params)).fetchall()
-        except sqlite3.Error as exc:
-            raise StorageError("query failed", detail=str(exc)) from exc
+        with self._lock:
+            try:
+                return self._conn.execute(sql, tuple(params)).fetchall()
+            except sqlite3.Error as exc:
+                raise StorageError("query failed", detail=str(exc)) from exc
 
     def close(self) -> None:
         """Close the connection. Idempotent."""
-        try:
-            self._conn.close()
-        except sqlite3.Error:  # pragma: no cover - already closed
-            pass
+        with self._lock:
+            try:
+                self._conn.close()
+            except sqlite3.Error:  # pragma: no cover - already closed
+                pass
 
     def __enter__(self) -> "SqliteStore":
         return self

@@ -3,98 +3,189 @@
 A local-first developer diagnostic assistant for Snapdragon-powered Windows PCs.
 
 Point it at a build log, a stack trace or a CI failure. It extracts the
-evidence, proposes ranked root-cause hypotheses, suggests read-only fixes, waits
-for your approval, and then verifies whether the fix actually worked.
+evidence, retrieves relevant context, proposes ranked root-cause hypotheses with
+citations, suggests a fix, **waits for your explicit approval**, applies only a
+predefined safe action, and then re-runs verification to show before/after.
 
 **Everything runs on your machine.** No account, no API key, no cloud call, no
 telemetry.
 
 ---
 
-## Phase 1 status
-
-Phase 1 is the **honest, dependency-light shell**: the whole workflow runs
-end-to-end on any Windows x64 developer machine, with no model download, no
-accelerator and no vendor SDK.
+## Status at a glance
 
 | Area | State |
 | --- | --- |
-| Evidence extraction with line citations | working |
-| Rule-based diagnosis, ranked and cited | working |
-| Remediation planning (proposes, never applies) | working |
-| Approval gate (default: approves nothing) | working |
-| Safety policy and command deny list | working |
-| Verification runner (6 read-only check kinds) | working |
-| PySide6 desktop shell (5 tabs, threaded) | working |
-| Headless CLI (imports no Qt) | working |
-| Structured JSONL logging with session ids | working |
-| Mock AI backend (deterministic, offline) | working |
-| SQLite run history | built, not yet wired in |
-| Retrieval index feeding the pipeline | built, not yet wired in |
-| Local model execution (ONNX Runtime) | Phase 2 |
-| Snapdragon / NPU execution provider | Phase 3+ |
+| Evidence extraction with line citations | **implemented** |
+| Lightweight retrieval (4-passage knowledge base) | **implemented** |
+| Rule-based diagnosis, ranked and cited | **implemented** |
+| Recommended fix with evidence references | **implemented** |
+| Explicit per-action approval gate | **implemented** |
+| Safe remediation via a fixed whitelist | **implemented** |
+| Verification + before/after result | **implemented** |
+| Deterministic demo scenario (FAILED -> PASSED) | **implemented** |
+| Benchmark framework (real measurements only) | **implemented** |
+| PySide6 desktop shell (7 tabs, threaded) | **implemented** |
+| Headless CLI (`--demo`, `--benchmark`, `--diagnose`) | **implemented** |
+| Mock AI backend (default, offline, no model) | **implemented** |
+| LocalAIBackend on ONNX Runtime | **implemented, no model shipped** |
+| SnapdragonAIBackend interface | **implemented, NOT validated** |
+| NPU execution on real hardware | **target-hardware validation pending** |
+
+> **Snapdragon deployment validation pending target hardware.**
+> No NPU execution, latency or memory figure in this repository was produced on
+> Snapdragon hardware. This development machine is Windows x64. The Snapdragon
+> backend is structurally complete and correctly reports itself unvalidated.
 
 ---
 
-## Requirements
-
-* Windows x64 (the product targets Windows; the core is portable Python)
-* Python 3.11 or newer
-* Disk space for the Qt toolkit - a couple of hundred megabytes
-
-**No AI engine, accelerator or Snapdragon package is required to start the
-application.**
-
----
-
-## Install
+## Quick start
 
 ```powershell
-git clone <your-fork-url> snapdragon-localops
-cd snapdragon-localops
-
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip
 python -m pip install -r requirements/dev.txt
 ```
 
-`requirements/dev.txt` pulls in `base.txt` (PySide6, pydantic,
-pydantic-settings) plus the test tooling.
-
-To work against an installed copy rather than the source tree:
-
-```powershell
-python -m pip install -e .
-```
-
-That also creates the `snapdragon-localops` launcher.
-
----
-
-## Running
-
-### Desktop shell
+**Launch the application:**
 
 ```powershell
 python -m app.main
 ```
 
-Opens the five-tab window: **Diagnosis**, **Evidence**, **Suggested fixes**,
-**Verification**, **This machine**. The pipeline runs on a worker thread, so the
-window stays responsive while a run reads files and starts subprocesses.
-
-### Headless (SSH, CI, no display)
+**Run the competition demo (headless, ~2 seconds):**
 
 ```powershell
-python -m app.main --diagnose path\to\build.log
-Get-Content build.log | python -m app.main --diagnose -
+python -m app.main --demo
 ```
 
-Prints the run outcome, every stage, the ranked hypotheses with their
-confidence, the caveats and the proposed actions - then stops. Nothing is
-approved and nothing is executed.
+**Show that nothing happens without approval:**
+
+```powershell
+python -m app.main --demo --demo-no-approve
+```
+
+**Measure this machine:**
+
+```powershell
+python -m app.main --benchmark
+```
+
+---
+
+## The demo scenario
+
+One deterministic story, offline, repeatable. The sample app ships with a real
+defect - it imports a module that does not exist - so it genuinely cannot start.
+
+1. The app is run and **really fails** with a `ModuleNotFoundError`.
+2. The real traceback is captured to a log file.
+3. Evidence extraction, retrieval and rule-based diagnosis run on it.
+4. One whitelisted fix is proposed, citing the extracted evidence.
+5. **Nothing is applied until approval is recorded.**
+6. The fix rewrites one import line, in-process, with no shell.
+7. The same check runs again.
+
+```
+BEFORE: FAILED
+AFTER:  PASSED
+```
+
+Both verdicts come from a subprocess exit code, so the display cannot disagree
+with what happened. The demo resets the sample app to its broken state at the
+start of every run, so it works on the second run exactly as it did on the first.
+
+With `--demo-no-approve`, the gate stops the workflow: the app stays broken and
+verification **fails**. That is the safety claim demonstrated rather than
+asserted.
+
+---
+
+## Architecture
+
+```
+Application (app/, PySide6 UI, headless CLI)
+    |
+    +-- AIBackend interface  (core/contracts/ai.py)
+            |
+            +-- MockAIBackend            deterministic, offline, no model (default)
+            +-- LightweightLocalAIBackend  real ONNX Runtime, no downloads
+            +-- SnapdragonAIBackend        NPU target, NOT validated
+```
+
+The application never imports a backend directly. Selection is a configuration
+change (`ai.llm.name`), and an unknown name is an error rather than a silent
+fallback to the mock.
+
+```
+             evidence
+                |
+     +----------+-----------+
+     |                      |
+ retrieval            diagnosis (rules)
+ (context only)              |
+     |                      |
+     +----------+-----------+
+                |
+          remediation plan
+                |
+     ===== approval gate =====
+                |
+        safe action (whitelist)
+                |
+          verification
+                |
+        BEFORE / AFTER
+```
+
+### Layer map
+
+| Package | Responsibility |
+| --- | --- |
+| `app/` | Entry point, pipeline orchestration, PySide6 shell |
+| `core/` | Contracts, config, safety kernel, errors, logging, storage |
+| `diagnostics/` | Evidence extraction, rule engine, remediation planner |
+| `demo/` | The demo scenario and the whitelisted safe actions |
+| `retrieval/` | Chunking, in-memory vector index, retriever |
+| `ai/` | AI backends (mock, local, snapdragon), ONNX runtime |
+| `benchmark/` | Measurement harness and host description |
+| `verification/` | Read-only check runner and check derivation |
+| `tests/` | The test suite |
+
+`core/contracts/` defines the interfaces; each layer package supplies concrete
+implementations. The desktop shell renders results and computes none of them,
+so the whole flow is equally reachable from a test or the CLI.
+
+---
+
+## The desktop shell
+
+```powershell
+python -m app.main
+```
+
+Seven tabs: **Diagnosis**, **Evidence**, **Suggested fixes**, **Verification**,
+**Demo**, **Benchmark**, **This machine**. The pipeline and the benchmark both
+run on worker threads, so the window stays responsive while a run starts
+subprocesses.
+
+### The status strip
+
+A bar across the top always states, in words:
+
+| Indicator | Meaning |
+| --- | --- |
+| `LOCAL MODE` | No data leaves this machine |
+| `MOCK AI` / `REAL AI` | Whether a model or the deterministic mock produced output |
+| `CPU` / `GPU` / `NPU` | Where work executed |
+| `VERIFIED` | That a real run backed the claim |
+
+`NPU` appears **only** after a verified NPU inference. An advertised-but-unproven
+provider renders as `NPU?` in a warning colour, never as a result. On this
+development machine the strip reads `LOCAL MODE` / `MOCK AI` / `CPU`.
+
+Every indicator is a word as well as a colour, so it stays readable in greyscale
+and for a user with colour vision deficiency.
 
 ### All flags
 
@@ -103,9 +194,19 @@ approved and nothing is executed.
 | `--config PATH` | Load a TOML config file |
 | `--data-dir PATH` | Override the data directory |
 | `--log-level LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
+| `--demo` | Run the built-in scenario end to end and print the result |
+| `--demo-no-approve` | With `--demo`, stop at the gate and change nothing |
+| `--benchmark` | Measure this machine's real pipeline latency |
 | `--diagnose [PATH]` | Run headlessly on a file, or stdin with `-` |
 | `--question TEXT` | The question to answer in `--diagnose` mode |
 | `--version` | Print the version and exit |
+
+### Headless (SSH, CI, no display)
+
+```powershell
+python -m app.main --diagnose path\to\build.log
+Get-Content build.log | python -m app.main --diagnose -
+```
 
 ---
 
@@ -115,19 +216,31 @@ approved and nothing is executed.
 python -m pytest
 ```
 
-133 tests, a couple of seconds, no network access and no model downloads. The
-UI tests run on Qt's `offscreen` platform, so no display is required.
+185 tests, a few seconds, no network access and no model downloads. The UI tests
+run on Qt's `offscreen` platform, so no display is required.
 
 Useful subsets:
 
 ```powershell
 python -m pytest -m "not ui"        # skip anything that builds Qt widgets
-python -m pytest tests/test_safety.py -v
+python -m pytest tests/test_demo_and_backends.py -v
 python -m pytest -q --tb=short
 ```
 
 No test touches your real user profile: `tests/conftest.py` points the whole
 application at a temporary data directory for every single test.
+
+| File | Covers |
+| --- | --- |
+| `test_diagnostics_flow.py` | Evidence, diagnosis, remediation, approval |
+| `test_evidence.py` | Extraction patterns and line citations |
+| `test_safety.py` | Approval gate, risk policy, command deny list |
+| `test_honesty_rules.py` | NPU-claim refusal, benchmark provenance |
+| `test_storage_and_retrieval.py` | Run history, index persistence |
+| `test_verification.py` | Check kinds and failure handling |
+| `test_ui.py` | The Qt shell renders and claims nothing |
+| `test_config_and_cli.py` | Configuration validation, entry points |
+| `test_demo_and_backends.py` | The demo, whitelist, backends, benchmark |
 
 ---
 
@@ -161,9 +274,9 @@ are the reason the project is worth building.
 The pipeline **stops at the approval gate**, and no configuration setting can
 skip it.
 
-1. The planner *proposes* read-only actions. It never executes.
+1. The planner *proposes* actions. It never executes.
 2. The UI shows every action with its risk, its description and the exact
-   command it would run.
+   target it would change.
 3. You approve or deny each action individually.
 4. Only approved actions run.
 5. The default policy blocks mutating actions, blocks network actions, enforces
@@ -174,6 +287,27 @@ skip it.
 raises. Approval is recorded per action id, and `apply_plan` deliberately does
 *not* rebuild the plan, so the actions you approved are the exact actions that
 run.
+
+### Remediations are a whitelist, not a command interpreter
+
+`demo/safe_actions.py` holds the complete set of changes this program is
+capable of making. Each entry is a reviewed **id** plus a reviewed Python
+callable. There is no code path from a plan, a log line, or pasted user text to
+a shell, an interpreter, `pip`, or the network.
+
+`apply_safe_action` checks, in this order:
+
+1. the action id must exist in the whitelist - an unknown id is **denied, not
+   attempted**;
+2. the safety policy must permit the action's risk;
+3. the caller must have recorded an approval.
+
+A whitelisted id is not a licence: `apply_safe_action(action, approved=False)`
+raises. The target path travels inside the action, so an approval is bound to
+*this* action on *this* file and cannot be replayed against another one.
+
+Adding a capability means adding a reviewed entry to that list, which is the
+point: what this tool can do to a machine is visible in one short file.
 
 ---
 
@@ -226,10 +360,11 @@ committed.
 app/          entry point, pipeline orchestration, PySide6 shell
 core/         contracts, config, safety, errors, observability, storage
 diagnostics/  evidence extraction, rule engine, remediation planner + executor
+demo/         the demo scenario and the whitelisted safe actions
 verification/ read-only check runner and check derivation
 retrieval/    chunking, in-memory vector index, retriever
-ai/           AI backend interface, mock backend, ONNX Runtime backend
-benchmark/    measurement harness and host description
+ai/           AI backends (mock, local, snapdragon) + ONNX Runtime layer
+benchmark/    measurement harness, host description, default case suite
 tests/        the test suite
 ```
 
@@ -240,31 +375,121 @@ so the whole flow is equally reachable from a test or the CLI.
 Every provider exposes `info` and `health()`, so a stage can report *why* it is
 unavailable instead of failing silently.
 
-### Optional local inference
+---
 
-The local inference stack lives in `requirements/ai.txt` and is **not installed
-during Phase 1**:
+## AI backends
 
-```powershell
-python -m pip install -r requirements/ai.txt
+All three implement the same `AIBackend` facade. Select one in configuration:
+
+```toml
+[ai.llm]
+name = "mock"        # default
 ```
 
-ONNX Runtime is hardware-agnostic: it runs on x64 today, and on the Snapdragon
-target it can be paired with a vendor execution provider. Qualcomm AI Hub
-Workbench is deliberately absent - it compiles models, it does not run them, and
-it belongs on a different machine.
+| Name | Class | What it does |
+| --- | --- | --- |
+| `mock` (default) | `MockAIBackend` | Deterministic, offline, no model, no download |
+| `local` | `LightweightLocalAIBackend` | Real ONNX Runtime inference on a model already on disk |
+| `snapdragon` | `SnapdragonAIBackend` | NPU target path - **not validated** |
+
+Selection never falls back silently. Choosing `local` with no model configured
+reports `not configured` rather than quietly reverting to the mock, and an
+unknown name raises `ProviderNotFoundError`.
+
+**`local`** performs a real forward pass over a small encoder-style model and
+reads the output. It is not a token-by-token text generator yet, and says so in
+the UI. It never downloads anything: a model must already exist on disk and be
+named in configuration. Install the optional stack with:
+
+```powershell
+python -m pip install -r requirements/ai.txt    # numpy + onnxruntime
+```
+
+**`snapdragon`** probes for the Qualcomm runtime and reports exactly what it
+finds. On this x64 machine it reports `not a Snapdragon host`. Every capability
+returns `None` and every load raises until a vendor runtime and a measured
+inference exist.
 
 ---
 
-## What Phase 1 deliberately does not do
+## Snapdragon deployment architecture
 
-* It does not download or run a language model.
-* It does not claim NPU acceleration.
-* It does not modify your system without an explicit per-action approval.
-* It does not require a Snapdragon device, or a vendor SDK, to be useful.
+```
+Application
+    |
+ AIBackend (interface - the only thing the app knows about)
+    |
+ SnapdragonAIBackend
+    |
+ SnapdragonRuntime  ->  Qualcomm execution provider (absent until target HW)
+    |
+ LoadedModel  ->  ExecutionTarget  ->  verified only by a real forward pass
+```
 
-Phase 2 adds real local model execution through ONNX Runtime. Phase 3+ adds the
-Snapdragon execution provider on the target hardware.
+**Status: Snapdragon deployment validation pending target hardware.**
+
+To make the NPU path real on the HP Snapdragon target:
+
+1. Install the Qualcomm runtime **on the target machine** (never on x64).
+2. Point configuration at a QNN/HTP-compiled artifact.
+3. Run `python -m app.main --benchmark` on the target so a real forward pass can
+   promote the target to `VERIFIED`.
+4. Call `SnapdragonAIBackend.record_verified_run(target)` with that verified
+   target, which is the only way the `NPU` indicator becomes available.
+
+Until step 4 happens on real hardware, the UI shows `CPU` and this README says
+validation is pending. Qualcomm AI Hub Workbench is deliberately absent - it
+compiles models, it does not run them, and it belongs on a different machine.
+
+---
+
+## Benchmark methodology
+
+`python -m app.main --benchmark` measures four cases - evidence extraction,
+rule-based diagnosis, retrieval search, and the end-to-end pipeline - on the
+same few-hundred-byte input the demo produces.
+
+How a number is produced:
+
+1. run `warmup_iterations` and discard them, so first-call import cost is not
+   reported as steady-state cost;
+2. run `iterations` timed iterations with `time.perf_counter_ns`, a monotonic
+   clock;
+3. compute every statistic **from those samples** - never from a typed-in
+   number, never estimated.
+
+A case that fails becomes a note saying `NOT MEASURED`. It is never dropped, and
+never becomes a zero. Below five samples, the noisy aggregates (stdev, p95) are
+omitted rather than presented as precision.
+
+Every row records: method, host, runtime, iteration count, warmup count, model
+id and artifact checksum, plus the execution target and how it was verified.
+`Measurement` raises if a row claims an unverified NPU, so an NPU number cannot
+be recorded by mistake even if the harness were modified.
+
+The full suite runs in well under a second and touches no model, no network, and
+nothing on disk.
+
+---
+
+## Known limitations
+
+* **The diagnosis is rule-based.** The demo's explanation comes from a fixed
+  signature table, reported as `rules_only`. It is not model inference and is
+  not presented as such.
+* **The embedding backend is a deterministic mock** - hashed bag-of-words. It
+  matches shared words, not meaning, and says so in its own provenance. Real
+  retrieval quality needs a real embedding model.
+* **The demo's knowledge base is four hand-written passages**, not a corpus.
+  Retrieval is demonstrated by picking the right one out of a handful.
+* **No model ships with the application.** `local` is fully implemented but has
+  nothing to load until you provide a model on disk.
+* **The NPU path is unvalidated.** No Snapdragon execution has been performed.
+* **Retrieval outside the demo is empty by default.** Nothing is indexed
+  automatically - a tool that silently indexes a whole project is a tool the
+  user cannot reason about. Index explicitly via `LocalRetriever.index_documents`.
+* `benchmark/` measures the deterministic stages. There is no model-inference
+  row, because no model is present to measure.
 
 ---
 

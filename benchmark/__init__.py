@@ -9,10 +9,27 @@ model in :mod:`core.contracts.benchmark` enforces most of that;
 There is deliberately no way to type a number in. If a case fails, the failure
 becomes a note in the report - never a zero, never an omission, and never a
 silently shortened list of cases.
+
+:func:`run_default_benchmark` is the suite the CLI and the UI run: four cases
+over a few hundred bytes of text, finishing in well under a second, measuring
+the work a user actually waits for.
 """
 
 from __future__ import annotations
 
+from benchmark.cases import (
+    SAMPLE_ERROR,
+    build_default_cases,
+    device_description,
+    run_default_benchmark,
+)
 from benchmark.runner import LocalBenchmarkRunner, host_description
 
-__all__ = ["LocalBenchmarkRunner", "host_description"]
+__all__ = [
+    "SAMPLE_ERROR",
+    "LocalBenchmarkRunner",
+    "build_default_cases",
+    "device_description",
+    "host_description",
+    "run_default_benchmark",
+]

@@ -59,6 +59,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="run headlessly on this file (or stdin with '-') and print a report",
     )
     parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="run the built-in demo scenario end to end and print the result",
+    )
+    parser.add_argument(
+        "--demo-no-approve",
+        action="store_true",
+        help="with --demo, stop at the approval gate and change nothing",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="measure this machine's real pipeline latency and print a report",
+    )
+    parser.add_argument(
         "--question",
         default="What is causing this failure?",
         help="the question to answer in --diagnose mode",
@@ -103,10 +118,55 @@ def main(argv: list[str] | None = None) -> int:
     )
     log_event(_log, logging.INFO, "app.started", session=session, version=__version__)
 
+    if args.benchmark:
+        return _run_benchmark(settings)
+
+    if args.demo:
+        return _run_demo(settings, approve=not args.demo_no_approve)
+
     if args.diagnose is not None:
         return _run_headless(settings, args)
 
     return _run_gui(settings)
+
+
+def _run_demo(settings, *, approve: bool) -> int:
+    """Run the built-in scenario end to end and print what happened."""
+    from demo import run_demo
+
+    result = run_demo(settings, approve=approve)
+
+    print(result.title)
+    print("=" * len(result.title))
+    for label, value in result.as_rows():
+        print(f"  {label:20} {value}")
+    print()
+    print("Verification detail")
+    for row in result.report:
+        print(f"  [{row.outcome.value}] {row.description} -> {row.observed}")
+    if result.notes:
+        print("\nApplied changes")
+        for note in result.notes:
+            print(f"  - {note}")
+
+    if not approve:
+        print(
+            "\nNo approval was given, so nothing was changed. "
+            "This is the safety gate working."
+        )
+        return 0
+    return 0 if result.worked else 1
+
+
+def _run_benchmark(settings) -> int:
+    """Measure this machine and print a report. Numbers are never invented."""
+    from benchmark import run_default_benchmark
+
+    report = run_default_benchmark(settings)
+    print(report.to_markdown())
+    if report.is_empty:
+        return 1
+    return 0
 
 
 def _run_headless(settings, args) -> int:

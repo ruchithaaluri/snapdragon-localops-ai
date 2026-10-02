@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
 
 from app.pipeline import LocalDiagnosticPipeline, build_pipeline
 from app.ui.panels import (
+    BenchmarkPanel,
+    DemoPanel,
     DiagnosisPanel,
     EnvironmentPanel,
     EvidencePanel,
@@ -37,6 +39,8 @@ from app.ui.panels import (
     VerificationPanel,
 )
 from app.ui.theme import Theme, stylesheet_for
+from app.ui.widgets import StatusStrip, app_status
+from core.contracts.base import ProviderInfo
 from core.contracts.diagnostics import DiagnosticQuery
 from core.contracts.pipeline import PipelineRun
 from core.errors import LocalOpsError
@@ -77,6 +81,35 @@ class _AnalysisWorker(QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class _BenchmarkWorker(QObject):
+    """Runs the measurement suite off the UI thread.
+
+    The suite is cheap but not instant, and it starts Python subprocesses via
+    the end-to-end case, so it must not run on the UI thread.
+    """
+
+    finished = Signal(object)   # BenchmarkReport
+    failed = Signal(str)
+
+    def __init__(self, settings) -> None:  # noqa: ANN001 - AppSettings
+        super().__init__()
+        self._settings = settings
+
+    def run(self) -> None:
+        from benchmark import run_default_benchmark
+
+        try:
+            self.finished.emit(run_default_benchmark(self._settings))
+        except Exception as exc:  # noqa: BLE001 - a failed measurement is not a crash
+            log_event(
+                _log,
+                logging.ERROR,
+                "ui.benchmark_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class MainWindow(QMainWindow):
     """The application window."""
 
@@ -88,12 +121,31 @@ class MainWindow(QMainWindow):
         self._last_run: PipelineRun | None = None
         self._thread: QThread | None = None
         self._worker: _AnalysisWorker | None = None
+        self._bench_thread: QThread | None = None
+        self._bench_worker: "_BenchmarkWorker | None" = None
+
+        # The AI backend is resolved once, here, so the status strip can report
+        # it without re-instantiating it. A backend that cannot be built (a
+        # typo in configuration) must not stop the window from opening.
+        try:
+            from ai.registry import build_ai_backend
+
+            backend = build_ai_backend(settings)
+            self._ai_info, self._ai_is_mock = backend.info, backend.is_mock()
+        except Exception as exc:  # noqa: BLE001 - a bad backend must not block start-up
+            log_event(
+                _log, logging.WARNING, "ui.ai_backend_unavailable", error=str(exc)
+            )
+            self._ai_info = ProviderInfo(
+                name="unavailable", kind="ai_backend", detail=str(exc)
+            )
+            self._ai_is_mock = True
 
         self.setWindowTitle(f"Snapdragon LocalOps AI  -  v{__version__}")
         self.resize(settings.ui.window_width, settings.ui.window_height)
         self._build()
         self._connect()
-        self.environment.refresh(settings)
+        self.environment.refresh(settings, self._pipeline)
         self.statusBar().showMessage("Ready. Nothing has been run yet.")
 
     # -- construction -----------------------------------------------------
@@ -103,18 +155,28 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(10, 10, 10, 10)
 
+        # The status strip sits above everything: LOCAL MODE, MOCK AI / REAL AI,
+        # and the accelerator, each as a word rather than a colour alone.
+        self._status_strip = QHBoxLayout()
+        self._status_strip.setSpacing(6)
+        layout.addLayout(self._status_strip)
+
         self.input = InputPanel()
         self.evidence = EvidencePanel()
         self.diagnosis = DiagnosisPanel(self._theme)
         self.remediation = RemediationPanel(self._theme)
         self.verification = VerificationPanel(self._theme)
         self.environment = EnvironmentPanel(self._theme)
+        self.demo = DemoPanel(self._theme, self._settings)
+        self.benchmark = BenchmarkPanel(self._theme)
 
         self._tabs = QTabWidget()
         self._tabs.addTab(self.diagnosis, "Diagnosis")
         self._tabs.addTab(self.evidence, "Evidence")
         self._tabs.addTab(self.remediation, "Suggested fixes")
         self._tabs.addTab(self.verification, "Verification")
+        self._tabs.addTab(self.demo, "Demo")
+        self._tabs.addTab(self.benchmark, "Benchmark")
         self._tabs.addTab(self.environment, "This machine")
 
         self._stage_bar = QLabel()
@@ -133,6 +195,27 @@ class MainWindow(QMainWindow):
         layout.addLayout(body, 1)
         layout.addWidget(self._stage_bar)
         self.setCentralWidget(central)
+        self._refresh_status_strip()
+
+    def _refresh_status_strip(self, target=None) -> None:  # noqa: ANN001 - ExecutionTarget
+        """Rebuild the indicator pills from live component state.
+
+        ``MOCK AI`` / ``REAL AI`` is read from the backend, and the accelerator
+        word is only ``NPU`` for a verified run. Both are resolved by
+        :mod:`app.ui.widgets.status_strip`, which has no Qt dependency and is
+        therefore testable without a display.
+        """
+        while self._status_strip.count():
+            item = self._status_strip.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        status = app_status(self._ai_info, self._ai_is_mock, target)
+        for pill in StatusStrip.pills(self._theme, status):
+            self._status_strip.addWidget(pill)
+        self._status_strip.addStretch(1)
+        self._backend_label = QLabel(f"backend: {status.backend}")
+        self._backend_label.setStyleSheet(f"color: {self._theme.text_dim};")
+        self._status_strip.addWidget(self._backend_label)
 
     def _connect(self) -> None:
         self.input.analyze_requested.connect(self.start_analysis)
@@ -140,6 +223,44 @@ class MainWindow(QMainWindow):
         self.remediation.denied.connect(self._on_denied)
         self.remediation.apply_requested.connect(self._on_apply)
         self.verification.run_requested.connect(self._on_run_checks)
+        self.benchmark.measure_requested.connect(self._on_measure)
+
+    # -- benchmark --------------------------------------------------------
+
+    def _on_measure(self) -> None:
+        """Run the measurement suite on a worker thread."""
+        if self._bench_thread is not None and self._bench_thread.isRunning():
+            return
+        self.benchmark.set_busy(True)
+        self.statusBar().showMessage("Measuring this machine...")
+
+        self._bench_thread = QThread(self)
+        self._bench_worker = _BenchmarkWorker(self._settings)
+        self._bench_worker.moveToThread(self._bench_thread)
+        self._bench_thread.started.connect(self._bench_worker.run)
+        self._bench_worker.finished.connect(self._on_benchmark_finished)
+        self._bench_worker.failed.connect(self._on_benchmark_failed)
+        self._bench_thread.start()
+
+    def _on_benchmark_finished(self, report) -> None:  # noqa: ANN001 - BenchmarkReport
+        self._teardown_bench()
+        self.benchmark.show_report(report)
+        self.statusBar().showMessage(
+            f"Benchmark: {len(report.measurements)} measurement(s) on {report.host}"
+        )
+
+    def _on_benchmark_failed(self, reason: str) -> None:
+        self._teardown_bench()
+        self.statusBar().showMessage("Benchmark failed")
+        QMessageBox.warning(self, "Benchmark failed", reason)
+
+    def _teardown_bench(self) -> None:
+        if self._bench_thread is not None:
+            self._bench_thread.quit()
+            self._bench_thread.wait(3000)
+        self._bench_thread = None
+        self._bench_worker = None
+        self.benchmark.set_busy(False)
 
     # -- analysis ---------------------------------------------------------
 
@@ -175,6 +296,9 @@ class MainWindow(QMainWindow):
         self.verification.clear()
         if run.diagnosis and run.diagnosis.provenance:
             self.environment.show_target(run.diagnosis.provenance.execution)
+            # The accelerator indicator follows the run that actually happened,
+            # so it reads CPU until a verified NPU run has been recorded.
+            self._refresh_status_strip(run.diagnosis.provenance.execution)
 
         self._stage_bar.setText(
             "  |  ".join(f"{stage}: {status}" for stage, status, _ in run.as_rows())
@@ -284,6 +408,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt event
         self._teardown_thread()
+        self._teardown_bench()
         super().closeEvent(event)
 
 

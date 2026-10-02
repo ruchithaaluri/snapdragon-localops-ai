@@ -55,6 +55,7 @@ packages = [
     "core.contracts",
     "core.observability",
     "core.storage",
+    "demo",
     "diagnostics",
     "diagnostics.remediation",
     "retrieval",

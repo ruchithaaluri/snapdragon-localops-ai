@@ -21,6 +21,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
 from app.ui.theme import Theme, stylesheet_for  # noqa: E402
 from app.ui.widgets import StatusPill  # noqa: E402
+from app.pipeline import build_retriever  # noqa: E402
 from core.contracts.verification import CheckKind, VerificationCheck  # noqa: E402
 from core.safety import RemediationAction  # noqa: E402
 from diagnostics import build_query  # noqa: E402
@@ -74,8 +75,30 @@ def test_the_window_builds_with_every_tab(window):
         "Evidence",
         "Suggested fixes",
         "Verification",
+        "Demo",
+        "Benchmark",
         "This machine",
     ]
+
+
+def test_the_status_strip_states_the_mode_in_words(window):
+    """The four indicators are words, and the mock one is honest about itself."""
+    words = [
+        window._status_strip.itemAt(i).widget().text()
+        for i in range(window._status_strip.count())
+        if window._status_strip.itemAt(i).widget() is not None
+        and hasattr(window._status_strip.itemAt(i).widget(), "text")
+    ]
+    assert "LOCAL MODE" in words
+    assert "MOCK AI" in words, "the default backend is the mock, and says so"
+    assert not any(w == "REAL AI" for w in words)
+    assert not any(w == "NPU" for w in words), "no NPU claim before a verified run"
+
+
+def test_the_demo_and_benchmark_tabs_start_empty(window):
+    """Nothing is claimed before a run happens."""
+    assert "not run" in window.demo._outcome.text().lower()
+    assert "No benchmark has run" in window.benchmark._summary.text()
 
 
 def test_a_fresh_window_has_run_nothing(window):
@@ -182,6 +205,49 @@ def test_a_verification_report_renders(window, log_file):
     window.verification.show_report(report)
     assert window.verification._table.rowCount() == 1
     assert window.verification._resolved.text() == "resolved"
+
+
+def test_the_environment_panel_reports_retrieval_and_history(window, settings):
+    """Both layers are reported, and neither is claimed when absent."""
+    window.environment.refresh(settings, window._pipeline)
+    values = dict(
+        (window.environment._table.item(i, 0).text(),
+         window.environment._table.item(i, 1).text())
+        for i in range(window.environment._table.rowCount())
+    )
+
+    assert "Retrieval" in values
+    assert "Run history" in values
+    # A fresh install indexes nothing, and must say so rather than claim a corpus.
+    assert values["Retrieval"] == "available, empty"
+
+
+def test_the_environment_panel_never_invents_a_chunk_count(window, settings):
+    """Indexing a document must be visible in the panel, not hidden."""
+    retriever = build_retriever(settings)
+    retriever.index_documents([("notes.md", "requests is missing from the venv.")])
+    window._pipeline._retriever = retriever
+
+    window.environment.refresh(settings, window._pipeline)
+    values = [
+        (
+            window.environment._table.item(i, 0).text(),
+            window.environment._table.item(i, 1).text(),
+        )
+        for i in range(window.environment._table.rowCount())
+    ]
+    assert ("Retrieval", "1 chunk(s) indexed") in values
+
+
+def test_the_environment_panel_admits_when_it_did_not_look(window, settings):
+    """No pipeline means 'not inspected' - never 'not available'."""
+    window.environment.refresh(settings)
+    values = [
+        window.environment._table.item(i, 1).text()
+        for i in range(window.environment._table.rowCount())
+    ]
+    assert "not inspected" in values
+    assert "not available" not in values
 
 
 def test_the_environment_panel_never_claims_an_npu(window, settings):
